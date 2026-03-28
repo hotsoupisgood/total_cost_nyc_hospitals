@@ -1,0 +1,459 @@
+---
+title: "Assignment 1 Predictive Modeling"
+author: "Lucas Henry 25252089"
+output: pdf_document
+editor_options:
+  markdown:
+    wrap: 72
+---
+# Data
+https://health.data.ny.gov/Health/Hospital-Inpatient-Discharges-SPARCS-De-Identified/sf4k-39ay/about_data  
+
+# Setup
+```{r message=FALSE, warning=FALSE}
+library(dagitty)
+library(ggdag)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(mice)
+library(Hmisc)
+library(VIM)
+
+library(gbm)
+
+set.seed(123)
+out.folder = "output_b"
+dir.create(out.folder, showWarnings = FALSE)
+```
+```{r loading data, cache=TRUE}
+# Load db
+df_raw=read.csv("DATA/NYSDOH/Hospital_Inpatient_Discharges_(SPARCS_De-Identified)__2024_20260307.csv")
+```
+## Summary
+2196737 observations and 33 variables
+```{r initial dims}
+str(df_raw)
+```
+
+# Preprocessing
+## Filter by tier 1 adult trauma facility
+- To remove dependence on hospital type/specialty, the dataset is filtered on hospital type defined as adult and pediatric level 1 trauma centers.
+- Mapping sourced from [here](https://profiles.health.ny.gov/Hospital/designated_center/Level+I+Adult+and+Pediatric+Trauma+Center).
+```{r filter hospitals}
+tier_1_hospitals = c('ELMHURST HOSPITAL CENTER','ERIE COUNTY MEDICAL CENTER','GOOD SAMARITAN HOSPITAL MEDICAL CENTER','JOHN R. OISHEI CHILDREN\'S HOSPITAL','LINCOLN MEDICAL & MENTAL HEALTH CENTER','NASSAU UNIVERSITY MEDICAL CENTER','NEW YORK-PRESBYTERIAN HOSPITAL - COLUMBIA PRESBYTERIAN CENTER','NEW YORK-PRESBYTERIAN HOSPITAL - NEW YORK WEILL CORNELL CENTER','NEWYORK-PRESBYTERIAN/QUEENS','UNIVERSITY HOSPITAL SUNY HEALTH SCIENCE CENTER', # tier 1 adult
+'ALBANY MEDICAL CENTER HOSPITAL','BELLEVUE HOSPITAL CENTER','JAMAICA HOSPITAL MEDICAL CENTER','KINGS COUNTY HOSPITAL CENTER','LONG ISLAND JEWISH MEDICAL CENTER','MAIMONIDES MEDICAL CENTER','NORTH SHORE UNIVERSITY HOSPITAL','NYU LANGONE HOSPITAL-LONG ISLAND','RICHMOND UNIVERSITY MEDICAL CENTER','STATEN ISLAND UNIVERSITY HOSP-NORTH','STONY BROOK UNIVERSITY HOSPITAL','STONY BROOK UNIVERSITY HOSPITAL') # tier 1 adult and peds
+
+df_filtered = df_raw %>% filter(Facility.Name%in%tier_1_hospitals)
+# compare observations
+tier1.filt.count = data.frame(
+  "total observations"        = nrow(df_raw),
+  "tier 1 truma observations" = nrow(df_filtered),
+  "difference"                = nrow(df_filtered)-nrow(df_raw)
+  )
+tier1.filt.count
+write.csv(tier1.filt.count, paste0(out.folder, "/tier1.filt.count.csv"), row.names = FALSE)
+```
+
+After filtering we now have `r nrow(df_filtered)` observations from tier 1 trauma facilities.
+
+## Filter to emergency department admissions only
+- I am only interested in ED cases for this analysis, so filtering on `Emergency.Department.Indicator == "Y"`.
+```{r filter ed}
+df_filtered = df_filtered %>% filter(Emergency.Department.Indicator == "Y")
+nrow(df_filtered)
+```
+After filtering to ED cases we have `r nrow(df_filtered)` observations.
+
+## Scale costs per 1,000
+
+```{r}
+df_filtered = df_filtered %>% mutate(Total.Costs=Total.Costs/1000)%>% mutate(Total.Charges=Total.Charges/1000)
+```
+
+## Sample and Subset columns of interest
+- Sampling 10,000 observations from the ED-filtered dataset to keep computation time manageable.
+```{r subset columns}
+set.seed(123)
+df_sample = df_filtered %>% sample_n(10000) %>% select(
+  Total.Costs,
+  Length.of.Stay,
+  APR.MDC.Description,
+  Facility.Name,
+  Age.Group,
+  Gender,
+  APR.Severity.of.Illness.Code,
+  Payment.Typology.1,
+  Type.of.Admission,
+  Patient.Disposition)
+```
+
+The response is `Total.Costs` (continuous, in thousands). The covariates are: `APR.MDC.Description`, `Facility.Name`, `Age.Group`, `Gender`, `APR.Severity.of.Illness.Code`, `Payment.Typology.1`, `Type.of.Admission`, and `Patient.Disposition`.
+# Understand categories
+```{r}
+print("Gender"); unique(df_sample$Gender)
+print("Severity of Illness Code"); unique(df_sample$APR.Severity.of.Illness.Code)
+print("Type of payment"); unique(df_sample$Payment.Typology.1)
+print("Type of Admission"); unique(df_sample$Type.of.Admission)
+print("Age Group"); unique(df_sample$Age.Group)
+print("Patient disposition"); unique(df_sample$Patient.Disposition)
+```
+
+# Investigate Missingess
+```{r missing data check}
+# Convert these values to NA for mice/aggr recognition.
+df_sample <- df_sample %>% 
+  mutate(across(where(is.character), ~na_if(trimws(.x), ""))) # all empty strings
+
+miss.df = data.frame(
+    count=colSums(is.na(df_sample)),
+    prop=round(colSums(is.na(df_sample))/nrow(df_sample), 5)
+)
+miss.df
+write.csv(miss.df, paste0(out.folder, "/missing_counts.csv"), row.names = FALSE)
+```
+- No values missing. 
+
+# Mutate factors
+```{r mutate into factors}
+df_sample = df_sample %>%
+  mutate(Facility.Name                  = factor(Facility.Name))%>%
+  mutate(APR.MDC.Description            = factor(APR.MDC.Description))%>%
+  mutate(Age.Group                      = factor(Age.Group))%>%
+  mutate(Gender                         = factor(Gender))%>%
+  mutate(APR.Severity.of.Illness.Code   = factor(APR.Severity.of.Illness.Code)) %>%
+  mutate(Payment.Typology.1             = factor(Payment.Typology.1))%>%
+  mutate(Type.of.Admission              = factor(Type.of.Admission)) %>%
+  mutate(Patient.Disposition            = factor(Patient.Disposition))%>%
+  mutate(Length.of.Stay            = as.numeric(gsub("[^0-9.]", "", Length.of.Stay)))
+```
+
+# Splitting into train and test
+- Splitting after imputation so missing data checks use the full dataset. 
+- Using a 70/30 split.
+
+```{r train test split}
+# get train ids
+train_idx = sample(1:nrow(df_sample), size = floor(0.7 * nrow(df_sample)))
+# get train df
+train_data = df_sample[train_idx, ]
+# get test df
+test_data  = df_sample[-train_idx, ]
+# display the train test counts
+data.frame(
+  set = c("train", "test"),
+  n   = c(nrow(train_data), nrow(test_data))
+)
+```
+
+
+# EDA on the response
+```{r eda response, fig.width=10, fig.height=5}
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+hist(train_data$Total.Costs, breaks = 50, main = "Total Costs (thousands)", xlab = "Cost ($k)")
+hist(log(train_data$Total.Costs + 1), breaks = 50, main = "log(Total Costs + 1)", xlab = "log Cost")
+```
+```{r cost summary}
+cost_stats = function(x) {
+  round(c(
+    Min=min(x), 
+    Q1=quantile(x,.25), 
+    Median=median(x), 
+    Mean=mean(x),
+    Q3=quantile(x,.75), 
+    Max=max(x), 
+    SD=sd(x)), 2)
+}
+
+cost_summary = data.frame(
+  Statistic = c("Min","Q1","Median","Mean","Q3","Max","SD"),
+  Population = cost_stats(df_filtered$Total.Costs),
+  Train = cost_stats(train_data$Total.Costs),
+  Test  = cost_stats(test_data$Total.Costs),
+  "Population Charges" = cost_stats(df_filtered$Total.Charges),
+  "raw cost" = cost_stats(df_raw$Total.Cost/1000)
+)
+rownames(cost_summary) = NULL
+df_filtered[which.max(df_filtered$Total.Costs), ]
+cost_summary
+write.csv(cost_summary, paste0(out.folder, "/cost_summary.csv"), row.names = FALSE)
+```
+
+- The cost distribution is right skewed, which is typical for hospital costs.
+- Log transforming to stabilise variance and reduce outliers. 
+- All models are fit on `log(Total.Costs + 1)` (+1 to keep postivive)
+- back-transformed for evaluation.
+
+- If train/test quantiles closely match the sample (and the sample matches the filtered population), the split is representative for the response distribution.
+
+```{r log transform}
+train_data$log_cost = log(train_data$Total.Costs + 1)
+test_data$log_cost  = log(test_data$Total.Costs + 1)
+```
+
+## Observations per hospital
+```{r hosp freq, fig.width=14, fig.height=5}
+hosp_freq = sort(table(train_data$Facility.Name), decreasing = TRUE)
+par(mfrow = c(1, 2), mar = c(14, 4, 3, 1))
+barplot(hosp_freq, las = 2, cex.names = 0.6, ylab = "n",
+        main = "Training observations per hospital")
+par(mar = c(4, 4, 3, 1))
+bp = boxplot(as.numeric(hosp_freq), main = "Hospital group size", ylab = "n")
+text(x = 1.3, y = bp$stats, labels = round(bp$stats), cex = 0.8)
+```
+
+- Unequal group sizes across hospitals motivates partial pooling (random effects). Hospitals with fewer observations are shrunk toward the grand mean.
+
+# Model 0: Random Effects (Hospital)
+- Linear mixed model with a hospital specific random intercept.
+- Captures baseline cost differences between facilities.
+
+```{r random effects model}
+suppressPackageStartupMessages(library(lme4))
+
+re.mod = lmer(
+  log_cost ~ APR.MDC.Description + Age.Group + Gender +
+    APR.Severity.of.Illness.Code + Payment.Typology.1 +
+    Type.of.Admission + Patient.Disposition + (1 | Facility.Name),
+  data = train_data,
+  REML = TRUE
+)
+
+re.pred_log = predict(re.mod, newdata = test_data, allow.new.levels = TRUE)
+re.pred = exp(re.pred_log) - 1  # back-transform
+
+re_mse = mean((re.pred - test_data$Total.Costs)^2)
+re_rmse = sqrt(re_mse)
+
+re_var = as.data.frame(VarCorr(re.mod))
+re_var
+write.csv(re_var, paste0(out.folder, "/random_effects_variance.csv"), row.names = FALSE)
+```
+
+## Top 10 significant coefficients
+```{r re top10}
+re_cc = as.data.frame(coef(summary(re.mod)))
+re_cc$term = rownames(re_cc)
+rownames(re_cc) = NULL
+re_cc = re_cc[abs(re_cc$`t value`) > 1.96, ]
+re_cc = re_cc[order(-abs(re_cc$`t value`)), ]
+re_top10 = head(re_cc[, c("term", "Estimate", "Std. Error", "t value")], 10)
+re_top10
+write.csv(re_top10, paste0(out.folder, "/re_top10_coefficients.csv"), row.names = FALSE)
+```
+- APR.Severity.of.Illness.Code4 andAPR.Severity.of.Illness.Code3 contribute most to total cost
+
+```{r re pred vs actual, fig.width=6, fig.height=5}
+plot(re.pred, test_data$Total.Costs, xlab = "Predicted", ylab = "Actual",
+     main = "RE: Predicted vs Actual")
+abline(0, 1, col = "red")
+```
+
+```{r y_test}
+y_test = test_data$Total.Costs
+```
+
+# Model 1: Gradient Boosted Trees
+## Fitting a boosted regression model
+- Use gaussian for a continuous response.
+- `interaction.depth` controls how many splits in each tree
+- `shrinkage` is the learning rate. 
+  - If small, may need more trees to converge
+- the way the categorical variables are split is that it will randomly choose a subset, and then some hosptials will go left and some will go right.
+```{r gbm fit}
+set.seed(123)
+
+boost.costs = gbm(log_cost ~ APR.MDC.Description + Facility.Name + Age.Group + Gender + APR.Severity.of.Illness.Code + Payment.Typology.1 + Type.of.Admission + Patient.Disposition,
+    data = train_data,
+    distribution = "gaussian",
+    n.trees = 10000,
+    interaction.depth = 4,
+    shrinkage = 0.01,
+    cv.folds = 5,
+    verbose = FALSE)
+```
+
+## Optimal number of trees
+```{r gbm perf, fig.width=8, fig.height=5}
+best_n_trees = gbm.perf(boost.costs, method = "cv")
+cat("Optimal number of trees (CV):", best_n_trees, "\n")
+```
+
+## Variable importance
+```{r gbm importance, fig.width=15, fig.height=6}
+# png(paste0(/out.folder,"/gbm_importance.png"), width = 900, height = 600)
+op <- par(mar = c(5, 10, 4, 2))
+gbm_summary = summary(boost.costs, plotit=TRUE, n.trees = best_n_trees, las=1)
+par(op)
+```
+
+- The relative influence plot shows which predictors contribute most to reducing the loss function across all trees.
+- Higher relative influence means the variable is more useful for predicting total costs.
+- Severity of illness code is the highest by almost double that of the facility
+
+## Partial dependence plots
+```{r gbm partial dependence}
+plot(boost.costs, i = as.character(gbm_summary$var[1]), n.trees = best_n_trees)
+
+# second variable: ordered by PD value with vertical labels
+pd2 = plot(boost.costs, i = as.character(gbm_summary$var[2]), return.grid = TRUE, n.trees = best_n_trees)
+pd2 = pd2[order(pd2$y), ]
+par(mar = c(18, 4, 4, 2))
+barplot(pd2$y, names.arg = pd2[[1]], las = 2, cex.names = 0.6,
+        ylab = "Partial Dependence",
+        main = paste("Partial Dependence:", gbm_summary$var[2]))
+```
+
+- Partial dependence plots show the effect of a single predictor on total costs after integrating out all other variables.
+- Severity of illness sees the high linear correlation in the response
+- the facility name appears more muted, however it is notable that the top 5 hospitals by importance are in new york city
+
+## GBM test evaluation
+```{r gbm test eval}
+boost.pred_log = predict(boost.costs, newdata = test_data, n.trees = best_n_trees)
+boost.pred = exp(boost.pred_log) - 1  # back-transform
+gbm_mse = mean((boost.pred - y_test)^2)
+gbm_rmse = sqrt(gbm_mse)
+cat("GBM test MSE:", round(gbm_mse, 4), "\n")
+cat("GBM test RMSE:", round(gbm_rmse, 4), "(thousands)\n")
+```
+
+```{r gbm pred vs actual, fig.width=6, fig.height=5}
+plot(boost.pred, y_test, xlab = "Predicted", ylab = "Actual",
+     main = "GBM: Predicted vs Actual")
+abline(0, 1, col = "red")
+```
+
+- GBM should show tighter scatter around the diagonal since boosting sequentially corrects errors.
+
+## Trying different shrinkage values
+```{r gbm shrinkage comparison}
+# compare with a smaller shrinkage (more conservative)
+boost.costs2 = gbm(log_cost ~ APR.MDC.Description + Facility.Name + Age.Group + Gender + APR.Severity.of.Illness.Code + Payment.Typology.1 + Type.of.Admission + Patient.Disposition,
+    data = train_data,
+    distribution = "gaussian",
+    n.trees = 10000,
+    interaction.depth = 1,
+    shrinkage = 0.001,
+    cv.folds = 5,
+    verbose = FALSE)
+best_n2 = gbm.perf(boost.costs2, method = "cv")
+boost.pred2 = exp(predict(boost.costs2, newdata = test_data, n.trees = best_n2)) - 1
+gbm_mse2 = mean((boost.pred2 - y_test)^2)
+cat("GBM (depth=1, shrinkage=0.001) test MSE:", round(gbm_mse2, 4), "\n")
+cat("GBM (depth=4, shrinkage=0.01) test MSE:", round(gbm_mse, 4), "\n")
+```
+
+- With a lower shrinkage, the model never converges
+
+# Adding Length of Stay
+- `Length.of.Stay` is a continuous predictor and a strong driver of hospital costs. Re-fitting both models with it included to quantify the improvement.
+
+## RE + LOS
+```{r re los model}
+re.los.mod = lmer(
+  log_cost ~ APR.MDC.Description + Age.Group + Gender +
+    APR.Severity.of.Illness.Code + Payment.Typology.1 +
+    Type.of.Admission + Patient.Disposition + Length.of.Stay + (1 | Facility.Name),
+  data = train_data,
+  REML = TRUE
+)
+
+re.los.pred = exp(predict(re.los.mod, newdata = test_data, allow.new.levels = TRUE)) - 1
+
+re_los_mse  = mean((re.los.pred - test_data$Total.Costs)^2)
+re_los_rmse = sqrt(re_los_mse)
+
+# capped version — cap at 99th percentile of training costs
+cap = quantile(train_data$Total.Costs, 0.99)
+re.los.pred.cap = pmin(re.los.pred, cap)
+re_los_cap_mse  = mean((re.los.pred.cap - test_data$Total.Costs)^2)
+re_los_cap_rmse = sqrt(re_los_cap_mse)
+
+cat("Uncapped max prediction:", round(max(re.los.pred), 2), "\n")
+cat("Cap (99th pctl):", round(cap, 2), "\n")
+cat("Uncapped MSE:", round(re_los_mse, 2), "| Capped MSE:", round(re_los_cap_mse, 2), "\n")
+
+re_los_var = as.data.frame(VarCorr(re.los.mod))
+re_los_var
+```
+
+```{r re los top10}
+re_los_cc = as.data.frame(coef(summary(re.los.mod)))
+re_los_cc$term = rownames(re_los_cc)
+rownames(re_los_cc) = NULL
+re_los_cc = re_los_cc[abs(re_los_cc$`t value`) > 1.96, ]
+re_los_cc = re_los_cc[order(-abs(re_los_cc$`t value`)), ]
+re_los_top10 = head(re_los_cc[, c("term", "Estimate", "Std. Error", "t value")], 10)
+re_los_top10
+write.csv(re_los_top10, paste0(out.folder, "/re_los_top10_coefficients.csv"), row.names = FALSE)
+```
+
+```{r re los pred vs actual, fig.width=6, fig.height=5}
+plot(re.los.pred, test_data$Total.Costs, xlab = "Predicted", ylab = "Actual",
+     main = "RE + LOS: Predicted vs Actual")
+abline(0, 1, col = "red")
+```
+
+## GBM + LOS
+```{r gbm with los, fig.width=8, fig.height=5}
+set.seed(123)
+n.trees=5000
+boost.los = gbm(log_cost ~ APR.MDC.Description + Facility.Name + Age.Group + Gender + APR.Severity.of.Illness.Code + Payment.Typology.1 + Type.of.Admission + Patient.Disposition + Length.of.Stay,
+    data = train_data,
+    distribution = "gaussian",
+    n.trees = n.trees,
+    interaction.depth = 4,
+    shrinkage = 0.01,
+    cv.folds = 5,
+    verbose = FALSE)
+
+best_n_los = gbm.perf(boost.los, method = "cv")
+cat("Optimal trees (CV):", best_n_los, "\n")
+
+# variable importance
+op <- par(mar = c(5, 10, 4, 2))
+summary(boost.los, plotit = TRUE, n.trees = best_n_los, las = 1)
+par(op)
+
+# partial dependence on LOS
+plot(boost.los, i = "Length.of.Stay", n.trees = best_n_los)
+
+# test evaluation (back-transform)
+boost.pred.los = exp(predict(boost.los, newdata = test_data, n.trees = best_n_los)) - 1
+gbm_los_mse  = mean((boost.pred.los - y_test)^2)
+gbm_los_rmse = sqrt(gbm_los_mse)
+gbm_los_r2   = cor(y_test, boost.pred.los)^2
+
+# predicted vs actual
+plot(boost.pred.los, y_test, xlab = "Predicted", ylab = "Actual",
+     main = "GBM + LOS: Predicted vs Actual")
+abline(0, 1, col = "red")
+```
+
+- Adding `Length.of.Stay` introduces a continuous predictor directly tied to resource consumption.
+
+# Final Comparison
+
+```{r final comparison}
+final_comp = data.frame(
+  Model = c("Random Effects", "RE + LOS", "RE + LOS (capped)", "GBM", "GBM + LOS"),
+  MSE   = round(c(re_mse, re_los_mse, re_los_cap_mse, gbm_mse, gbm_los_mse), 4),
+  RMSE  = round(c(re_rmse, re_los_rmse, re_los_cap_rmse, gbm_rmse, gbm_los_rmse), 4),
+  R2    = round(c(
+    cor(y_test, re.pred)^2,
+    cor(y_test, re.los.pred)^2,
+    cor(y_test, re.los.pred.cap)^2,
+    cor(y_test, boost.pred)^2,
+    gbm_los_r2
+  ), 4)
+)
+final_comp = final_comp[order(-final_comp$R2), ]
+rownames(final_comp) = NULL
+final_comp
+write.csv(final_comp, paste0(out.folder, "/final_comparison.csv"), row.names = FALSE)
+```
+
+- Without LOS, all predictors are categorical and models can only estimate group-level means, limiting explanatory power.
+- MSE/RMSE: lower is better. RMSE is in the same units as the response (thousands of dollars).
+- R-squared: proportion of variance in costs explained by the model. Higher is better.
